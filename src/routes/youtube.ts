@@ -1,9 +1,20 @@
 import { Router, Request, Response } from "express";
 import fetch from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import type { PreviewResult, YoutubeQuality, MediaItem } from "../types";
 
 const router = Router();
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY ?? "";
+
+// Optional proxy for the upstream googlevideo byte-fetch. Google blocks
+// datacenter IPs (e.g. Render) with 403; routing the media fetch through a
+// residential proxy fixes it. Unset locally (home IP isn't blocked), set on
+// Render: PROXY_URL=http://user:pass@host:port
+const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || "";
+const proxyAgent = PROXY_URL ? new HttpsProxyAgent(PROXY_URL) : undefined;
+if (PROXY_URL) {
+  console.log("[youtube] upstream media fetch routed through PROXY_URL");
+}
 
 function extractYoutubeVideoId(url: string): string | null {
   // Handles: watch?v=, youtu.be/, /embed/, /v/, /shorts/
@@ -373,6 +384,7 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
 
   try {
     const upstream = await fetch(downloadUrl, {
+      agent: proxyAgent as any,
       headers: {
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
@@ -508,6 +520,7 @@ router.get("/stream", async (req: Request, res: Response) => {
   try {
     const rangeHeader = req.headers["range"];
     const upstream = await fetch(downloadUrl!, {
+      agent: proxyAgent as any,
       headers: {
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
