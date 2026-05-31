@@ -140,15 +140,98 @@ router.post("/preview", async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/youtube/download?url=<mediaUrl>&filename=<name>
- * Proxies the YouTube media stream to the client.
+ * GET /api/youtube/download-fresh?videoId=<id>&itag=<n>&filename=<name>
  *
- * IMPORTANT: YouTube CDN URLs are signed with c=ANDROID_VR client.
- * The User-Agent MUST match that client type or YouTube returns 403.
+ * Re-fetches a fresh CDN URL from the YouTube API at download time so that
+ * the server IP that GENERATES the signed URL is the SAME IP that immediately
+ * streams it. This avoids the `pot` (Proof of Origin Token) 403 that occurs
+ * when the cached preview URL is used from a different IP on Render.
  */
 
-// Must match the client that generated the signed URL (c=ANDROID_VR from yt-api)
+// Must match the client that generated the signed URL (c=ANDROID_VR from yt-api).
+// Using a mismatched UA (e.g., desktop Chrome) causes YouTube to return 403.
 const YT_UA = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; Build/SQ3A.220705.001.B1) gzip";
+
+router.get("/download-fresh", async (req: Request, res: Response) => {
+  const { videoId, itag, filename } = req.query as {
+    videoId?: string; itag?: string; filename?: string;
+  };
+  if (!videoId || !itag) {
+    return res.status(400).json({ error: "videoId and itag are required" });
+  }
+
+  try {
+    // ── Step 1: re-fetch from YouTube API (current server IP baked into URL) ──
+    const apiRes = await fetch(
+      `https://yt-api.p.rapidapi.com/dl?id=${videoId}&cgeo=US`,
+      {
+        headers: {
+          "X-RapidAPI-Key": RAPIDAPI_KEY,
+          "X-RapidAPI-Host": "yt-api.p.rapidapi.com",
+        },
+      }
+    );
+
+    if (!apiRes.ok) {
+      const text = await apiRes.text();
+      return res.status(502).json({ error: `YouTube API error ${apiRes.status}: ${text.substring(0, 200)}` });
+    }
+
+    const json = await apiRes.json() as any;
+    if (json.status !== "OK") {
+      return res.status(404).json({ error: "Video not found or is private." });
+    }
+
+    // ── Step 2: find matching format by itag ──────────────────────────────────
+    const allFormats: any[] = [
+      ...(json.formats ?? []),
+      ...(json.adaptiveFormats ?? []),
+    ];
+    const format = allFormats.find((f: any) => String(f.itag) === String(itag));
+    if (!format?.url) {
+      return res.status(404).json({ error: `Quality itag=${itag} not available for this video.` });
+    }
+
+    const freshUrl: string = format.url;
+    const contentTypeHint: string = format.mimeType ?? "video/mp4";
+
+    // ── Step 3: stream immediately (same IP, same pot) ────────────────────────
+    const upstream = await fetch(freshUrl, {
+      headers: {
+        "User-Agent": YT_UA,
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+      },
+    });
+
+    if (!upstream.ok) {
+      console.error(`[youtube/download-fresh] upstream ${upstream.status}`);
+      return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
+    }
+
+    const contentType = upstream.headers.get("content-type") ?? contentTypeHint;
+    const contentLength = upstream.headers.get("content-length");
+
+    let safeFilename = filename ?? `stash_youtube_${itag}.mp4`;
+    if (contentType.includes("webm") && safeFilename.endsWith(".mp4")) {
+      safeFilename = safeFilename.replace(/\.mp4$/i, ".webm");
+    }
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+
+    if (upstream.body) {
+      upstream.body.pipe(res);
+    } else {
+      const buf = await (upstream as any).buffer();
+      res.end(buf);
+    }
+  } catch (err: any) {
+    console.error("[youtube/download-fresh]", err);
+    res.status(500).json({ error: err.message ?? "Internal server error" });
+  }
+});
 
 router.get("/download", async (req: Request, res: Response) => {
   const { url, filename } = req.query as { url?: string; filename?: string };
