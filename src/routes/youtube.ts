@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import fetch from "node-fetch";
+import ytdl from "@distube/ytdl-core";
 import type { PreviewResult, YoutubeQuality, MediaItem } from "../types";
 
 const router = Router();
@@ -142,16 +143,11 @@ router.post("/preview", async (req: Request, res: Response) => {
 /**
  * GET /api/youtube/download-fresh?videoId=<id>&itag=<n>&filename=<name>
  *
- * Re-fetches a fresh CDN URL from the YouTube API at download time so that
- * the server IP that GENERATES the signed URL is the SAME IP that immediately
- * streams it. This avoids the `pot` (Proof of Origin Token) 403 that occurs
- * when the cached preview URL is used from a different IP on Render.
+ * Uses @distube/ytdl-core to stream the video directly from YouTube.
+ * This bypasses the CDN URL proxy approach which fails because cloud
+ * provider IPs (Render, AWS, etc.) are blocked by YouTube's CDN.
+ * ytdl-core handles authentication and routing internally.
  */
-
-// Must match the client that generated the signed URL (c=ANDROID_VR from yt-api).
-// Using a mismatched UA (e.g., desktop Chrome) causes YouTube to return 403.
-const YT_UA = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; Build/SQ3A.220705.001.B1) gzip";
-
 router.get("/download-fresh", async (req: Request, res: Response) => {
   const { videoId, itag, filename } = req.query as {
     videoId?: string; itag?: string; filename?: string;
@@ -160,57 +156,19 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "videoId and itag are required" });
   }
 
+  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
   try {
-    // ── Step 1: re-fetch from YouTube API (current server IP baked into URL) ──
-    const apiRes = await fetch(
-      `https://yt-api.p.rapidapi.com/dl?id=${videoId}&cgeo=US`,
-      {
-        headers: {
-          "X-RapidAPI-Key": RAPIDAPI_KEY,
-          "X-RapidAPI-Host": "yt-api.p.rapidapi.com",
-        },
-      }
-    );
+    // Get video info to find the matching format
+    const info = await ytdl.getInfo(videoUrl);
+    const format = ytdl.chooseFormat(info.formats, { quality: Number(itag) });
 
-    if (!apiRes.ok) {
-      const text = await apiRes.text();
-      return res.status(502).json({ error: `YouTube API error ${apiRes.status}: ${text.substring(0, 200)}` });
+    if (!format) {
+      return res.status(404).json({ error: `Quality itag=${itag} not available.` });
     }
 
-    const json = await apiRes.json() as any;
-    if (json.status !== "OK") {
-      return res.status(404).json({ error: "Video not found or is private." });
-    }
-
-    // ── Step 2: find matching format by itag ──────────────────────────────────
-    const allFormats: any[] = [
-      ...(json.formats ?? []),
-      ...(json.adaptiveFormats ?? []),
-    ];
-    const format = allFormats.find((f: any) => String(f.itag) === String(itag));
-    if (!format?.url) {
-      return res.status(404).json({ error: `Quality itag=${itag} not available for this video.` });
-    }
-
-    const freshUrl: string = format.url;
-    const contentTypeHint: string = format.mimeType ?? "video/mp4";
-
-    // ── Step 3: stream immediately (same IP, same pot) ────────────────────────
-    const upstream = await fetch(freshUrl, {
-      headers: {
-        "User-Agent": YT_UA,
-        "Referer": "https://www.youtube.com/",
-        "Origin": "https://www.youtube.com",
-      },
-    });
-
-    if (!upstream.ok) {
-      console.error(`[youtube/download-fresh] upstream ${upstream.status}`);
-      return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
-    }
-
-    const contentType = upstream.headers.get("content-type") ?? contentTypeHint;
-    const contentLength = upstream.headers.get("content-length");
+    const mimeType = format.mimeType ?? "video/mp4";
+    const contentType = mimeType.split(";")[0].trim(); // e.g. "video/mp4"
 
     let safeFilename = filename ?? `stash_youtube_${itag}.mp4`;
     if (contentType.includes("webm") && safeFilename.endsWith(".mp4")) {
@@ -219,114 +177,99 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (format.contentLength) res.setHeader("Content-Length", format.contentLength);
 
-    if (upstream.body) {
-      upstream.body.pipe(res);
-    } else {
-      const buf = await (upstream as any).buffer();
-      res.end(buf);
-    }
-  } catch (err: any) {
-    console.error("[youtube/download-fresh]", err);
-    res.status(500).json({ error: err.message ?? "Internal server error" });
-  }
-});
-
-router.get("/download", async (req: Request, res: Response) => {
-  const { url, filename } = req.query as { url?: string; filename?: string };
-  if (!url) return res.status(400).json({ error: "url is required" });
-
-  try {
-    const upstream = await fetch(url, {
-      headers: {
-        "User-Agent": YT_UA,
-        "Referer": "https://www.youtube.com/",
-        "Origin": "https://www.youtube.com",
-      },
+    // Stream directly to the response
+    const stream = ytdl(videoUrl, { format });
+    stream.on("error", (err) => {
+      console.error("[youtube/download-fresh] stream error:", err.message);
+      if (!res.headersSent) {
+        res.status(502).json({ error: "Stream failed: " + err.message });
+      } else {
+        res.destroy();
+      }
     });
+    stream.pipe(res);
 
-    if (!upstream.ok) {
-      console.error(`[youtube/download] upstream ${upstream.status} for ${url.substring(0, 80)}...`);
-      return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
-    }
-
-    const contentType = upstream.headers.get("content-type") ?? "video/mp4";
-    const contentLength = upstream.headers.get("content-length");
-
-    // Correct the file extension when content is actually WebM
-    let safeFilename = filename ?? "stash_youtube.mp4";
-    if (contentType.includes("webm") && safeFilename.endsWith(".mp4")) {
-      safeFilename = safeFilename.replace(/\.mp4$/i, ".webm");
-    }
-
-    res.setHeader("Content-Type", contentType);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${safeFilename}"`
-    );
-    if (contentLength) res.setHeader("Content-Length", contentLength);
-
-    if (upstream.body) {
-      upstream.body.pipe(res);
-    } else {
-      const buf = await upstream.buffer();
-      res.end(buf);
-    }
   } catch (err: any) {
-    console.error("[youtube/download]", err);
-    res.status(500).json({ error: err.message ?? "Internal server error" });
+    console.error("[youtube/download-fresh]", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message ?? "Download failed" });
+    }
   }
 });
-
-// YT_UA is defined above near the download route
 
 /**
- * GET /api/youtube/stream?url=<mediaUrl>
- * Proxies YouTube video for INLINE browser preview (no Content-Disposition).
- * Supports Range requests for seeking.
- *
+ * GET /api/youtube/download?videoId=<id>&itag=<n>&filename=<name>   [legacy alias]
+ * Kept for backwards compat — forwards to /download-fresh logic via ytdl.
+ */
+router.get("/download", async (req: Request, res: Response) => {
+  const { videoId, itag, filename, url } = req.query as {
+    videoId?: string; itag?: string; filename?: string; url?: string;
+  };
+
+  // Legacy callers pass a raw CDN url — extract videoId from it if possible
+  let vid = videoId;
+  if (!vid && url) {
+    const m = (url as string).match(/[?&]id=o-[^&]+/); // old-style id= in CDN url
+    // Fall back: try extracting from the url directly (not reliable for CDN URLs)
+    // Just proxy the request to download-fresh by forwarding the query
+    return res.redirect(307, `/api/youtube/download-fresh?${req.url.split("?")[1] ?? ""}`);
+  }
+  if (!vid || !itag) {
+    return res.status(400).json({ error: "videoId and itag required (or use /download-fresh)" });
+  }
+  return res.redirect(307, `/api/youtube/download-fresh?videoId=${vid}&itag=${itag}&filename=${filename ?? ""}`);
+});
+
+/**
+ * GET /api/youtube/stream?videoId=<id>&itag=<n>
+ * Streams a YouTube video for inline browser preview using ytdl-core.
  * Also used by the mobile app (expo-file-system) for downloads.
- * IMPORTANT: Same UA requirement as /download — must match c=ANDROID_VR.
  */
 router.get("/stream", async (req: Request, res: Response) => {
-  const { url } = req.query as { url?: string };
-  if (!url) return res.status(400).json({ error: "url is required" });
+  const { videoId, itag } = req.query as { videoId?: string; itag?: string };
+
+  // Legacy: some callers pass ?url= (the old CDN URL). Extract videoId from query.
+  const legacyUrl = (req.query.url as string | undefined);
+  let vid = videoId;
+  if (!vid && legacyUrl) {
+    // Try to get videoId from the legacy url — not possible from CDN url, so fail gracefully
+    return res.status(400).json({ error: "Legacy stream URLs are no longer supported. Fetch a fresh preview." });
+  }
+  if (!vid) return res.status(400).json({ error: "videoId is required" });
+
+  const videoUrl = `https://www.youtube.com/watch?v=${vid}`;
 
   try {
-    const rangeHeader = req.headers["range"];
-    const upstream = await fetch(url, {
-      headers: {
-        "User-Agent": YT_UA,
-        ...(rangeHeader ? { Range: rangeHeader } : {}),
-      },
-    });
+    const info = await ytdl.getInfo(videoUrl);
+    const format = itag
+      ? ytdl.chooseFormat(info.formats, { quality: Number(itag) })
+      : ytdl.chooseFormat(info.formats, { quality: "highestvideo", filter: "audioandvideo" });
 
-    if (!upstream.ok && upstream.status !== 206) {
-      return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
+    if (!format) {
+      return res.status(404).json({ error: "No suitable format found." });
     }
 
-    const contentType = upstream.headers.get("content-type") ?? "video/mp4";
-    const contentLength = upstream.headers.get("content-length");
-    const contentRange = upstream.headers.get("content-range");
-    const acceptRanges = upstream.headers.get("accept-ranges") ?? "bytes";
+    const mimeType = format.mimeType ?? "video/mp4";
+    const contentType = mimeType.split(";")[0].trim();
 
-    res.status(upstream.status);
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Accept-Ranges", acceptRanges);
+    res.setHeader("Accept-Ranges", "none");
     res.setHeader("Cache-Control", "no-cache");
-    if (contentLength) res.setHeader("Content-Length", contentLength);
-    if (contentRange) res.setHeader("Content-Range", contentRange);
+    if (format.contentLength) res.setHeader("Content-Length", format.contentLength);
 
-    if (upstream.body) {
-      upstream.body.pipe(res);
-    } else {
-      const buf = await upstream.buffer();
-      res.end(buf);
-    }
+    const stream = ytdl(videoUrl, { format });
+    stream.on("error", (err) => {
+      console.error("[youtube/stream] stream error:", err.message);
+      if (!res.headersSent) res.status(502).json({ error: err.message });
+      else res.destroy();
+    });
+    stream.pipe(res);
+
   } catch (err: any) {
-    console.error("[youtube/stream]", err);
-    res.status(500).json({ error: err.message ?? "Internal server error" });
+    console.error("[youtube/stream]", err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message ?? "Stream failed" });
   }
 });
 
