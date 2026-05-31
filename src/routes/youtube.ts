@@ -1,6 +1,5 @@
 import { Router, Request, Response } from "express";
 import fetch from "node-fetch";
-import ytdl from "@distube/ytdl-core";
 import type { PreviewResult, YoutubeQuality, MediaItem } from "../types";
 
 const router = Router();
@@ -141,12 +140,62 @@ router.post("/preview", async (req: Request, res: Response) => {
 });
 
 /**
+ * Maps a YouTube itag number to the closest cobalt.tools quality string.
+ * cobalt supports: "144", "240", "360", "480", "720", "1080", "1440", "2160", "max"
+ */
+function itagToQuality(itag: number): string {
+  if (itag === 22)  return "720";  // muxed 720p
+  if (itag === 18)  return "360";  // muxed 360p
+  if ([266, 264, 137, 399, 248, 303, 313, 315].includes(itag)) return "1080";
+  if ([136, 398, 247, 302, 308, 271].includes(itag)) return "720";
+  if ([135, 397, 244, 298].includes(itag)) return "480";
+  if ([134, 396, 243].includes(itag)) return "360";
+  if ([133, 395, 242].includes(itag)) return "240";
+  if ([160, 394, 278].includes(itag)) return "144";
+  return "360"; // safe default
+}
+
+/**
+ * Calls cobalt.tools API and returns the download URL.
+ * cobalt runs its own YouTube infrastructure that isn't IP-blocked.
+ */
+async function cobaltGetUrl(videoId: string, quality: string): Promise<string> {
+  const cobaltRes = await fetch("https://api.cobalt.tools/", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+    },
+    body: JSON.stringify({
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      videoQuality: quality,
+      filenameStyle: "basic",
+      downloadMode: "auto",
+    }),
+  });
+
+  if (!cobaltRes.ok) {
+    throw new Error(`Cobalt API error: ${cobaltRes.status}`);
+  }
+
+  const cobalt = await cobaltRes.json() as any;
+  console.log("[cobalt]", cobalt.status, videoId, quality);
+
+  if (cobalt.status === "error") {
+    throw new Error(cobalt.error?.code ?? "Cobalt returned error");
+  }
+
+  // cobalt returns status: "stream", "redirect", or "tunnel"
+  const url = cobalt.url ?? cobalt.picker?.[0]?.url;
+  if (!url) throw new Error("No download URL from cobalt");
+  return url as string;
+}
+
+/**
  * GET /api/youtube/download-fresh?videoId=<id>&itag=<n>&filename=<name>
  *
- * Uses @distube/ytdl-core to stream the video directly from YouTube.
- * This bypasses the CDN URL proxy approach which fails because cloud
- * provider IPs (Render, AWS, etc.) are blocked by YouTube's CDN.
- * ytdl-core handles authentication and routing internally.
+ * Uses cobalt.tools to download the YouTube video.
+ * Proxies the stream through our backend so the browser can save it.
  */
 router.get("/download-fresh", async (req: Request, res: Response) => {
   const { videoId, itag, filename } = req.query as {
@@ -156,117 +205,64 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "videoId and itag are required" });
   }
 
-  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
   try {
-    // Get video info to find the matching format
-    const info = await ytdl.getInfo(videoUrl);
-    const format = ytdl.chooseFormat(info.formats, { quality: Number(itag) });
+    const quality = itagToQuality(Number(itag));
+    const downloadUrl = await cobaltGetUrl(videoId, quality);
 
-    if (!format) {
-      return res.status(404).json({ error: `Quality itag=${itag} not available.` });
+    // Proxy the stream so the browser gets it as a file download
+    const upstream = await fetch(downloadUrl);
+    if (!upstream.ok) {
+      return res.status(502).json({ error: `Stream fetch failed: ${upstream.status}` });
     }
 
-    const mimeType = format.mimeType ?? "video/mp4";
-    const contentType = mimeType.split(";")[0].trim(); // e.g. "video/mp4"
+    const contentType = upstream.headers.get("content-type") ?? "video/mp4";
+    const contentLength = upstream.headers.get("content-length");
 
-    let safeFilename = filename ?? `stash_youtube_${itag}.mp4`;
+    let safeFilename = (filename as string | undefined) ?? `stash_youtube_${quality}p.mp4`;
     if (contentType.includes("webm") && safeFilename.endsWith(".mp4")) {
       safeFilename = safeFilename.replace(/\.mp4$/i, ".webm");
     }
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
-    if (format.contentLength) res.setHeader("Content-Length", format.contentLength);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
 
-    // Stream directly to the response
-    const stream = ytdl(videoUrl, { format });
-    stream.on("error", (err) => {
-      console.error("[youtube/download-fresh] stream error:", err.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: "Stream failed: " + err.message });
-      } else {
-        res.destroy();
-      }
-    });
-    stream.pipe(res);
-
+    if (upstream.body) {
+      upstream.body.pipe(res);
+    } else {
+      const buf = await (upstream as any).buffer();
+      res.end(buf);
+    }
   } catch (err: any) {
     console.error("[youtube/download-fresh]", err.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message ?? "Download failed" });
-    }
+    if (!res.headersSent) res.status(500).json({ error: err.message ?? "Download failed" });
   }
 });
 
 /**
- * GET /api/youtube/download?videoId=<id>&itag=<n>&filename=<name>   [legacy alias]
- * Kept for backwards compat — forwards to /download-fresh logic via ytdl.
+ * GET /api/youtube/download?videoId=<id>&itag=<n>&filename=<name> [legacy alias]
  */
 router.get("/download", async (req: Request, res: Response) => {
-  const { videoId, itag, filename, url } = req.query as {
-    videoId?: string; itag?: string; filename?: string; url?: string;
-  };
-
-  // Legacy callers pass a raw CDN url — extract videoId from it if possible
-  let vid = videoId;
-  if (!vid && url) {
-    const m = (url as string).match(/[?&]id=o-[^&]+/); // old-style id= in CDN url
-    // Fall back: try extracting from the url directly (not reliable for CDN URLs)
-    // Just proxy the request to download-fresh by forwarding the query
-    return res.redirect(307, `/api/youtube/download-fresh?${req.url.split("?")[1] ?? ""}`);
-  }
-  if (!vid || !itag) {
-    return res.status(400).json({ error: "videoId and itag required (or use /download-fresh)" });
-  }
-  return res.redirect(307, `/api/youtube/download-fresh?videoId=${vid}&itag=${itag}&filename=${filename ?? ""}`);
+  const qs = req.url.split("?")[1] ?? "";
+  return res.redirect(307, `/api/youtube/download-fresh?${qs}`);
 });
 
 /**
  * GET /api/youtube/stream?videoId=<id>&itag=<n>
- * Streams a YouTube video for inline browser preview using ytdl-core.
- * Also used by the mobile app (expo-file-system) for downloads.
+ *
+ * Returns a 307 redirect to the cobalt.tools stream URL.
+ * Used by the mobile app (expo-video / expo-file-system) which follows redirects.
+ * Web preview now uses the YouTube iframe embed instead.
  */
 router.get("/stream", async (req: Request, res: Response) => {
   const { videoId, itag } = req.query as { videoId?: string; itag?: string };
-
-  // Legacy: some callers pass ?url= (the old CDN URL). Extract videoId from query.
-  const legacyUrl = (req.query.url as string | undefined);
-  let vid = videoId;
-  if (!vid && legacyUrl) {
-    // Try to get videoId from the legacy url — not possible from CDN url, so fail gracefully
-    return res.status(400).json({ error: "Legacy stream URLs are no longer supported. Fetch a fresh preview." });
-  }
-  if (!vid) return res.status(400).json({ error: "videoId is required" });
-
-  const videoUrl = `https://www.youtube.com/watch?v=${vid}`;
+  if (!videoId) return res.status(400).json({ error: "videoId is required" });
 
   try {
-    const info = await ytdl.getInfo(videoUrl);
-    const format = itag
-      ? ytdl.chooseFormat(info.formats, { quality: Number(itag) })
-      : ytdl.chooseFormat(info.formats, { quality: "highestvideo", filter: "audioandvideo" });
-
-    if (!format) {
-      return res.status(404).json({ error: "No suitable format found." });
-    }
-
-    const mimeType = format.mimeType ?? "video/mp4";
-    const contentType = mimeType.split(";")[0].trim();
-
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Accept-Ranges", "none");
-    res.setHeader("Cache-Control", "no-cache");
-    if (format.contentLength) res.setHeader("Content-Length", format.contentLength);
-
-    const stream = ytdl(videoUrl, { format });
-    stream.on("error", (err) => {
-      console.error("[youtube/stream] stream error:", err.message);
-      if (!res.headersSent) res.status(502).json({ error: err.message });
-      else res.destroy();
-    });
-    stream.pipe(res);
-
+    const quality = itagToQuality(Number(itag ?? 18));
+    const streamUrl = await cobaltGetUrl(videoId, quality);
+    // Redirect — expo-video and expo-file-system both follow 307 redirects
+    return res.redirect(307, streamUrl);
   } catch (err: any) {
     console.error("[youtube/stream]", err.message);
     if (!res.headersSent) res.status(500).json({ error: err.message ?? "Stream failed" });
