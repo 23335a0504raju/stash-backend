@@ -142,7 +142,14 @@ router.post("/preview", async (req: Request, res: Response) => {
 /**
  * GET /api/youtube/download?url=<mediaUrl>&filename=<name>
  * Proxies the YouTube media stream to the client.
+ *
+ * IMPORTANT: YouTube CDN URLs are signed with c=ANDROID_VR client.
+ * The User-Agent MUST match that client type or YouTube returns 403.
  */
+
+// Must match the client that generated the signed URL (c=ANDROID_VR from yt-api)
+const YT_UA = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; Build/SQ3A.220705.001.B1) gzip";
+
 router.get("/download", async (req: Request, res: Response) => {
   const { url, filename } = req.query as { url?: string; filename?: string };
   if (!url) return res.status(400).json({ error: "url is required" });
@@ -150,9 +157,7 @@ router.get("/download", async (req: Request, res: Response) => {
   try {
     const upstream = await fetch(url, {
       headers: {
-        // YouTube requires a realistic user-agent AND referer to serve video
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": YT_UA,
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
       },
@@ -191,12 +196,15 @@ router.get("/download", async (req: Request, res: Response) => {
   }
 });
 
-const YT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+// YT_UA is defined above near the download route
 
 /**
  * GET /api/youtube/stream?url=<mediaUrl>
  * Proxies YouTube video for INLINE browser preview (no Content-Disposition).
  * Supports Range requests for seeking.
+ *
+ * Also used by the mobile app (expo-file-system) for downloads.
+ * IMPORTANT: Same UA requirement as /download — must match c=ANDROID_VR.
  */
 router.get("/stream", async (req: Request, res: Response) => {
   const { url } = req.query as { url?: string };
