@@ -150,23 +150,32 @@ router.get("/download", async (req: Request, res: Response) => {
   try {
     const upstream = await fetch(url, {
       headers: {
-        // YouTube requires a realistic user-agent
+        // YouTube requires a realistic user-agent AND referer to serve video
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
       },
     });
 
     if (!upstream.ok) {
+      console.error(`[youtube/download] upstream ${upstream.status} for ${url.substring(0, 80)}...`);
       return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
     }
 
     const contentType = upstream.headers.get("content-type") ?? "video/mp4";
     const contentLength = upstream.headers.get("content-length");
 
+    // Correct the file extension when content is actually WebM
+    let safeFilename = filename ?? "stash_youtube.mp4";
+    if (contentType.includes("webm") && safeFilename.endsWith(".mp4")) {
+      safeFilename = safeFilename.replace(/\.mp4$/i, ".webm");
+    }
+
     res.setHeader("Content-Type", contentType);
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${filename ?? "stash_youtube.mp4"}"`
+      `attachment; filename="${safeFilename}"`
     );
     if (contentLength) res.setHeader("Content-Length", contentLength);
 
