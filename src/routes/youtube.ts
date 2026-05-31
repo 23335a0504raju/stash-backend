@@ -160,34 +160,42 @@ function itagToQuality(itag: number): string {
  * cobalt runs its own YouTube infrastructure that isn't IP-blocked.
  */
 async function cobaltGetUrl(videoId: string, quality: string): Promise<string> {
+  const requestBody = {
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    videoQuality: quality,
+  };
+
+  console.log("[cobalt] requesting", requestBody);
+
   const cobaltRes = await fetch("https://api.cobalt.tools/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Accept": "application/json",
     },
-    body: JSON.stringify({
-      url: `https://www.youtube.com/watch?v=${videoId}`,
-      videoQuality: quality,
-      filenameStyle: "basic",
-      downloadMode: "auto",
-    }),
+    body: JSON.stringify(requestBody),
   });
 
+  // Read body regardless of status for better error messages
+  const bodyText = await cobaltRes.text();
+  console.log("[cobalt] response", cobaltRes.status, bodyText.substring(0, 300));
+
   if (!cobaltRes.ok) {
-    throw new Error(`Cobalt API error: ${cobaltRes.status}`);
+    throw new Error(`Cobalt API error: ${cobaltRes.status} — ${bodyText.substring(0, 150)}`);
   }
 
-  const cobalt = await cobaltRes.json() as any;
-  console.log("[cobalt]", cobalt.status, videoId, quality);
+  let cobalt: any;
+  try { cobalt = JSON.parse(bodyText); } catch {
+    throw new Error(`Cobalt returned non-JSON: ${bodyText.substring(0, 100)}`);
+  }
 
   if (cobalt.status === "error") {
-    throw new Error(cobalt.error?.code ?? "Cobalt returned error");
+    throw new Error(cobalt.error?.code ?? cobalt.text ?? "Cobalt returned error");
   }
 
-  // cobalt returns status: "stream", "redirect", or "tunnel"
+  // cobalt returns status: "stream", "redirect", "tunnel", or "picker"
   const url = cobalt.url ?? cobalt.picker?.[0]?.url;
-  if (!url) throw new Error("No download URL from cobalt");
+  if (!url) throw new Error(`Cobalt gave status '${cobalt.status}' but no url`);
   return url as string;
 }
 
