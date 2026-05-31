@@ -13,6 +13,49 @@ function extractYoutubeVideoId(url: string): string | null {
   return match ? match[1] : null;
 }
 
+/**
+ * Strategy 0: Resolve YouTube CDN stream URL via RapidAPI.
+ * Since the user already has a working RapidAPI key configured for preview,
+ * we can use it to fetch the actual video formats and CDN URLs.
+ */
+async function rapidapiGetUrl(videoId: string, itag: number): Promise<string> {
+  if (!RAPIDAPI_KEY) {
+    throw new Error("RAPIDAPI_KEY is not configured in .env");
+  }
+
+  const apiRes = await fetch(
+    `https://yt-api.p.rapidapi.com/dl?id=${videoId}&cgeo=US`,
+    {
+      headers: {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": "yt-api.p.rapidapi.com",
+      },
+    }
+  );
+
+  if (!apiRes.ok) {
+    const text = await apiRes.text();
+    throw new Error(`RapidAPI error ${apiRes.status}: ${text}`);
+  }
+
+  const json = await apiRes.json() as any;
+  if (json.status !== "OK") {
+    throw new Error(json.msg ?? "Could not resolve video via RapidAPI");
+  }
+
+  const formats = [
+    ...(json.formats ?? []),
+    ...(json.adaptiveFormats ?? []),
+  ];
+
+  const format = formats.find((f: any) => f.itag === itag);
+  if (!format || !format.url) {
+    throw new Error(`Quality itag ${itag} not available via RapidAPI`);
+  }
+
+  return format.url as string;
+}
+
 function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
@@ -144,66 +187,126 @@ router.post("/preview", async (req: Request, res: Response) => {
  * cobalt supports: "144", "240", "360", "480", "720", "1080", "1440", "2160", "max"
  */
 function itagToQuality(itag: number): string {
-  if (itag === 22)  return "720";  // muxed 720p
-  if (itag === 18)  return "360";  // muxed 360p
-  if ([266, 264, 137, 399, 248, 303, 313, 315].includes(itag)) return "1080";
-  if ([136, 398, 247, 302, 308, 271].includes(itag)) return "720";
-  if ([135, 397, 244, 298].includes(itag)) return "480";
-  if ([134, 396, 243].includes(itag)) return "360";
-  if ([133, 395, 242].includes(itag)) return "240";
-  if ([160, 394, 278].includes(itag)) return "144";
-  return "360"; // safe default
+  if (itag === 22) return "720";
+  if (itag === 18) return "360";
+  if (itag === 137 || itag === 299 || itag === 303) return "1080";
+  if (itag === 136 || itag === 298 || itag === 302) return "720";
+  if (itag === 135 || itag === 244) return "480";
+  if (itag === 134 || itag === 243) return "360";
+  if (itag === 133 || itag === 242) return "240";
+  if (itag === 160 || itag === 278) return "144";
+  if (itag === 313 || itag === 401) return "2160";
+  if (itag === 271 || itag === 400) return "1440";
+  return "720"; // default fallback
 }
 
 /**
- * Calls cobalt.tools API and returns the download URL.
- * cobalt runs its own YouTube infrastructure that isn't IP-blocked.
+ * Strategy 1: cobalt.tools with API key (set COBALT_API_KEY env var on Render).
+ * Get a free key at: https://cobalt.tools/
  */
 async function cobaltGetUrl(videoId: string, quality: string): Promise<string> {
-  const requestBody = {
-    url: `https://www.youtube.com/watch?v=${videoId}`,
-    videoQuality: quality,
+  const apiKey = process.env.COBALT_API_KEY;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
   };
+  if (apiKey) headers["Authorization"] = `Api-Key ${apiKey}`;
 
-  console.log("[cobalt] requesting", requestBody);
-
-  const cobaltRes = await fetch("https://api.cobalt.tools/", {
+  const res = await fetch("https://api.cobalt.tools/", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-    },
-    body: JSON.stringify(requestBody),
+    headers,
+    body: JSON.stringify({
+      url: `https://www.youtube.com/watch?v=${videoId}`,
+      videoQuality: quality,
+    }),
   });
 
-  // Read body regardless of status for better error messages
-  const bodyText = await cobaltRes.text();
-  console.log("[cobalt] response", cobaltRes.status, bodyText.substring(0, 300));
+  const bodyText = await res.text();
+  console.log("[cobalt]", res.status, bodyText.substring(0, 200));
 
-  if (!cobaltRes.ok) {
-    throw new Error(`Cobalt API error: ${cobaltRes.status} — ${bodyText.substring(0, 150)}`);
-  }
+  if (!res.ok) throw new Error(`cobalt ${res.status}: ${bodyText.substring(0, 120)}`);
 
-  let cobalt: any;
-  try { cobalt = JSON.parse(bodyText); } catch {
-    throw new Error(`Cobalt returned non-JSON: ${bodyText.substring(0, 100)}`);
-  }
+  let data: any;
+  try { data = JSON.parse(bodyText); } catch { throw new Error("cobalt non-JSON"); }
+  if (data.status === "error") throw new Error(data.error?.code ?? "cobalt error");
 
-  if (cobalt.status === "error") {
-    throw new Error(cobalt.error?.code ?? cobalt.text ?? "Cobalt returned error");
-  }
-
-  // cobalt returns status: "stream", "redirect", "tunnel", or "picker"
-  const url = cobalt.url ?? cobalt.picker?.[0]?.url;
-  if (!url) throw new Error(`Cobalt gave status '${cobalt.status}' but no url`);
+  const url = data.url ?? data.picker?.[0]?.url;
+  if (!url) throw new Error("cobalt: no url in response");
   return url as string;
+}
+
+/**
+ * Strategy 2: YouTube's internal MWEB player API.
+ * MWEB client URLs are signed differently — less IP-restricted than ANDROID_VR.
+ * Returns muxed (video+audio) stream URLs directly from YouTube's player endpoint.
+ */
+async function youtubeInternalGetUrl(videoId: string, itag: number): Promise<string> {
+  const playerRes = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/112.0 Mobile Safari/537.36",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+        "X-YouTube-Client-Name": "2",
+        "X-YouTube-Client-Version": "2.20240726.00.00",
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "MWEB",
+            clientVersion: "2.20240726.00.00",
+            hl: "en",
+            gl: "US",
+            userAgent: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/112.0 Mobile Safari/537.36",
+          },
+        },
+        playbackContext: {
+          contentPlaybackContext: {
+            html5Preference: "HTML5_PREF_WANTS",
+            signatureTimestamp: 20150,
+          },
+        },
+        contentCheckOk: true,
+        racyCheckOk: true,
+      }),
+    }
+  );
+
+  if (!playerRes.ok) throw new Error(`YouTube player API: ${playerRes.status}`);
+
+  const playerData = await playerRes.json() as any;
+
+  if (playerData.playabilityStatus?.status !== "OK") {
+    throw new Error(`Video not playable: ${playerData.playabilityStatus?.reason ?? "unknown"}`);
+  }
+
+  const formats: any[] = [
+    ...(playerData.streamingData?.formats ?? []),
+    ...(playerData.streamingData?.adaptiveFormats ?? []),
+  ];
+
+  // Try exact itag first, then fall back to any muxed format
+  let format = formats.find((f: any) => f.itag === itag);
+  if (!format) format = formats.find((f: any) => f.itag === 18); // 360p muxed fallback
+  if (!format) format = formats.find((f: any) => f.mimeType?.includes("video/mp4") && f.audioChannels);
+
+  if (!format?.url) {
+    throw new Error(`No suitable format found (itag ${itag})`);
+  }
+
+  console.log(`[ytinternal] found format itag=${format.itag} mime=${format.mimeType}`);
+  return format.url as string;
 }
 
 /**
  * GET /api/youtube/download-fresh?videoId=<id>&itag=<n>&filename=<name>
  *
- * Uses cobalt.tools to download the YouTube video.
- * Proxies the stream through our backend so the browser can save it.
+ * Tries strategy 2 (YouTube internal MWEB API) first.
+ * If COBALT_API_KEY env var is set, tries cobalt first (most reliable).
  */
 router.get("/download-fresh", async (req: Request, res: Response) => {
   const { videoId, itag, filename } = req.query as {
@@ -213,14 +316,75 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "videoId and itag are required" });
   }
 
-  try {
-    const quality = itagToQuality(Number(itag));
-    const downloadUrl = await cobaltGetUrl(videoId, quality);
+  const itagNum = Number(itag);
+  const quality = itagToQuality(itagNum);
+  const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    // Proxy the stream so the browser gets it as a file download
-    const upstream = await fetch(downloadUrl);
+  let downloadUrl: string | null = null;
+  const errors: string[] = [];
+
+  // Try RapidAPI first (most reliable and already configured)
+  try {
+    downloadUrl = await rapidapiGetUrl(videoId, itagNum);
+    console.log("[download-fresh] RapidAPI success");
+  } catch (e: any) {
+    errors.push(`rapidapi: ${e.message}`);
+    console.warn("[download-fresh] RapidAPI failed, trying cobalt/internal:", e.message);
+  }
+
+  // Try cobalt next if API key is configured (most reliable)
+  if (!downloadUrl && process.env.COBALT_API_KEY) {
+    try {
+      downloadUrl = await cobaltGetUrl(videoId, quality);
+      console.log("[download-fresh] cobalt success");
+    } catch (e: any) {
+      errors.push(`cobalt: ${e.message}`);
+      console.warn("[download-fresh] cobalt failed, trying YouTube internal:", e.message);
+    }
+  }
+
+  // Fall back to YouTube internal MWEB API
+  if (!downloadUrl) {
+    try {
+      downloadUrl = await youtubeInternalGetUrl(videoId, itagNum);
+      console.log("[download-fresh] YouTube internal success");
+    } catch (e: any) {
+      errors.push(`ytinternal: ${e.message}`);
+      console.error("[download-fresh] YouTube internal failed:", e.message);
+    }
+  }
+
+  // If cobalt key exists but wasn't tried first (no key), try cobalt as final fallback anyway
+  if (!downloadUrl && !process.env.COBALT_API_KEY) {
+    try {
+      downloadUrl = await cobaltGetUrl(videoId, quality);
+    } catch (e: any) {
+      errors.push(`cobalt-nokey: ${e.message}`);
+    }
+  }
+
+  if (!downloadUrl) {
+    return res.status(502).json({
+      error: "Download unavailable from cloud. Open on YouTube directly.",
+      youtubeUrl,
+      details: errors,
+    });
+  }
+
+  try {
+    const upstream = await fetch(downloadUrl, {
+      headers: {
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/112.0 Mobile Safari/537.36",
+      },
+    });
+
     if (!upstream.ok) {
-      return res.status(502).json({ error: `Stream fetch failed: ${upstream.status}` });
+      return res.status(502).json({
+        error: `Upstream ${upstream.status}. Try opening on YouTube.`,
+        youtubeUrl,
+      });
     }
 
     const contentType = upstream.headers.get("content-type") ?? "video/mp4";
@@ -242,8 +406,10 @@ router.get("/download-fresh", async (req: Request, res: Response) => {
       res.end(buf);
     }
   } catch (err: any) {
-    console.error("[youtube/download-fresh]", err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message ?? "Download failed" });
+    console.error("[download-fresh] stream error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message, youtubeUrl });
+    }
   }
 });
 
@@ -256,24 +422,130 @@ router.get("/download", async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/youtube/stream?videoId=<id>&itag=<n>
+ * GET /api/youtube/stream?videoId=<id>&itag=<n>&url=<legacyUrl>
  *
- * Returns a 307 redirect to the cobalt.tools stream URL.
- * Used by the mobile app (expo-video / expo-file-system) which follows redirects.
- * Web preview now uses the YouTube iframe embed instead.
+ * Resolves a fresh stream URL using the 3-step strategy and proxies the media content.
+ * Supports Range headers for seekable video playback in expo-video and browser players.
+ * Also handles legacy calls that pass a raw CDN URL under `url`.
  */
 router.get("/stream", async (req: Request, res: Response) => {
-  const { videoId, itag } = req.query as { videoId?: string; itag?: string };
-  if (!videoId) return res.status(400).json({ error: "videoId is required" });
+  const { videoId, itag, url } = req.query as { videoId?: string; itag?: string; url?: string };
+
+  let downloadUrl: string | null = null;
+  let finalVideoId = videoId;
+  const itagNum = Number(itag ?? 18);
+
+  // Handle legacy/fallback: if a url query parameter is passed, try to extract videoId
+  if (url) {
+    const extractedId = extractYoutubeVideoId(url);
+    if (extractedId) {
+      finalVideoId = extractedId;
+    } else {
+      // Use raw URL directly if we cannot parse it (e.g. old googlevideo CDN url)
+      downloadUrl = url;
+    }
+  }
+
+  if (!finalVideoId && !downloadUrl) {
+    return res.status(400).json({ error: "videoId or url is required" });
+  }
+
+  const quality = itagToQuality(itagNum);
+
+  // Resolve fresh download/stream URL if we have the videoId
+  if (!downloadUrl && finalVideoId) {
+    const errors: string[] = [];
+
+    // Try RapidAPI first (most reliable and already configured)
+    try {
+      downloadUrl = await rapidapiGetUrl(finalVideoId, itagNum);
+      console.log("[stream] resolved via RapidAPI");
+    } catch (e: any) {
+      errors.push(`rapidapi: ${e.message}`);
+      console.warn("[stream] RapidAPI failed, trying cobalt/internal:", e.message);
+    }
+
+    // Try Cobalt next if API key is configured
+    if (!downloadUrl && process.env.COBALT_API_KEY) {
+      try {
+        downloadUrl = await cobaltGetUrl(finalVideoId, quality);
+        console.log("[stream] resolved via cobalt");
+      } catch (e: any) {
+        errors.push(`cobalt: ${e.message}`);
+        console.warn("[stream] cobalt failed, trying YouTube internal:", e.message);
+      }
+    }
+
+    // Fall back to YouTube internal MWEB player API
+    if (!downloadUrl) {
+      try {
+        downloadUrl = await youtubeInternalGetUrl(finalVideoId, itagNum);
+        console.log("[stream] resolved via YouTube internal");
+      } catch (e: any) {
+        errors.push(`ytinternal: ${e.message}`);
+        console.error("[stream] YouTube internal failed:", e.message);
+      }
+    }
+
+    // Key-less cobalt final fallback if no key is configured
+    if (!downloadUrl && !process.env.COBALT_API_KEY) {
+      try {
+        downloadUrl = await cobaltGetUrl(finalVideoId, quality);
+        console.log("[stream] resolved via keyless cobalt fallback");
+      } catch (e: any) {
+        errors.push(`cobalt-nokey: ${e.message}`);
+      }
+    }
+
+    if (!downloadUrl) {
+      return res.status(502).json({
+        error: "Stream currently unavailable from cloud.",
+        details: errors,
+      });
+    }
+  }
 
   try {
-    const quality = itagToQuality(Number(itag ?? 18));
-    const streamUrl = await cobaltGetUrl(videoId, quality);
-    // Redirect — expo-video and expo-file-system both follow 307 redirects
-    return res.redirect(307, streamUrl);
+    const rangeHeader = req.headers["range"];
+    const upstream = await fetch(downloadUrl!, {
+      headers: {
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/112.0 Mobile Safari/537.36",
+        ...(rangeHeader ? { Range: rangeHeader } : {}),
+      },
+    });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      console.error(`[youtube/stream] upstream status ${upstream.status} for ${downloadUrl?.substring(0, 100)}...`);
+      return res.status(502).json({ error: `Upstream fetch failed: ${upstream.status}` });
+    }
+
+    const contentType = upstream.headers.get("content-type") ?? "video/mp4";
+    const contentLength = upstream.headers.get("content-length");
+    const contentRange = upstream.headers.get("content-range");
+    const acceptRanges = upstream.headers.get("accept-ranges") ?? "bytes";
+
+    res.status(upstream.status); // 200 or 206 (partial)
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Accept-Ranges", acceptRanges);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+
+    if (upstream.body) {
+      upstream.body.pipe(res);
+    } else {
+      const buf = await (upstream as any).buffer();
+      res.end(buf);
+    }
   } catch (err: any) {
-    console.error("[youtube/stream]", err.message);
-    if (!res.headersSent) res.status(500).json({ error: err.message ?? "Stream failed" });
+    console.error("[youtube/stream] streaming error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message ?? "Stream failed" });
+    }
   }
 });
 
