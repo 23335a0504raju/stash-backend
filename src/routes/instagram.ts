@@ -5,20 +5,25 @@ import type { PreviewResult, MediaItem } from "../types";
 const router = Router();
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY ?? "";
 
-// Posts + reels (URL-keyed): GET /download?url=<instagram url>
-// Replaces instagram120, which was delisted from RapidAPI (gateway returns
-// 404 "API doesn't exists" for every path on that host).
-const REELS_API_HOST = "instagram-reels-downloader-api.p.rapidapi.com";
+// One URL-keyed API covers posts, carousels, reels and stories:
+//   GET /convert?url=<instagram url>  →  { media: [{ type, quality, thumbnail, url }] }
+//
+// History: instagram120 was delisted from RapidAPI (its host returns 404
+// "API doesn't exists" for every path), and its replacement,
+// instagram-reels-downloader-api, capped the free plan at 20 requests/month
+// and failed 3 of 8 identical requests. This one is a single API for every
+// link type, so there is one quota and one failure mode to reason about.
+const IG_API_HOST =
+  "instagram-downloader-download-instagram-stories-videos4.p.rapidapi.com";
 
-// Stories (username-keyed): POST /get_ig_user_stories.php, form-encoded.
-const STORIES_API_HOST = "instagram-scraper-stable-api.p.rapidapi.com";
+// Retried on 5xx only; a 4xx means the link itself is bad.
+const TRANSIENT_ERROR = /try again later|timeout|busy|temporarily/i;
 
-// The reels API fails roughly a third of the time on perfectly valid links —
-// measured 5/8 success on identical back-to-back requests. It surfaces this
-// two ways, both as HTTP 500: an "undergoing an upgrade" message, and a
-// literal "[object Object]" from a bug in their own error handling. Every 5xx
-// here is therefore treated as transient; only 4xx means the post is bad.
-const TRANSIENT_ERROR = /undergoing an upgrade|try again later|timeout|busy/i;
+const BROWSER_HEADERS = {
+  Referer: "https://www.instagram.com/",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+};
 
 /** Upstream sometimes sends a stringified object as its message — hide it. */
 function cleanUpstreamMessage(message: unknown): string {
@@ -30,10 +35,40 @@ function cleanUpstreamMessage(message: unknown): string {
 }
 
 /**
- * Calls the reels downloader, retrying transient upstream failures, and
- * returns the `data` object. Throws once retries are exhausted.
+ * The downloader returns media URLs but no author or caption, which the app's
+ * preview card shows. Instagram's public oembed fills that in for free (no
+ * RapidAPI quota). It is best-effort: it is rate-limited and can be blocked
+ * from datacenter IPs, so a failure degrades to empty strings rather than
+ * failing the request.
  */
-async function fetchInstagramMedia(igUrl: string, attempts = 4): Promise<any> {
+async function fetchOembedMeta(
+  igUrl: string
+): Promise<{ author: string; title: string }> {
+  const empty = { author: "", title: "" };
+  try {
+    const res = await fetch(
+      `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(igUrl)}`,
+      { headers: BROWSER_HEADERS, timeout: 6000 }
+    );
+    if (!res.ok) return empty;
+    const json: any = await res.json();
+    return {
+      author: json?.author_name ?? "",
+      title: json?.title ?? "",
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * Calls the downloader, retrying transient upstream failures, and returns the
+ * `media` array. Throws once retries are exhausted.
+ */
+async function fetchInstagramMedia(
+  igUrl: string,
+  attempts = 3
+): Promise<any[]> {
   let lastError = "Instagram API request failed";
 
   for (let i = 0; i < attempts; i++) {
@@ -43,13 +78,14 @@ async function fetchInstagramMedia(igUrl: string, attempts = 4): Promise<any> {
     let responseText: string;
     try {
       apiRes = await fetch(
-        `https://${REELS_API_HOST}/download?url=${encodeURIComponent(igUrl)}`,
+        `https://${IG_API_HOST}/convert?url=${encodeURIComponent(igUrl)}`,
         {
           headers: {
             "Content-Type": "application/json",
             "X-RapidAPI-Key": RAPIDAPI_KEY,
-            "X-RapidAPI-Host": REELS_API_HOST,
+            "X-RapidAPI-Host": IG_API_HOST,
           },
+          timeout: 45000,
         }
       );
       responseText = await apiRes.text();
@@ -67,10 +103,10 @@ async function fetchInstagramMedia(igUrl: string, attempts = 4): Promise<any> {
       continue;
     }
 
-    if (json?.success && json?.data) return json.data;
+    if (Array.isArray(json?.media)) return json.media;
 
     const status = Number(json?.code ?? apiRes.status);
-    lastError = cleanUpstreamMessage(json?.message);
+    lastError = cleanUpstreamMessage(json?.message ?? json?.error);
     console.error("[instagram] upstream", status, responseText.slice(0, 200));
 
     // 4xx means the link itself is bad — retrying cannot help.
@@ -86,28 +122,14 @@ function extractInstagramShortcode(url: string): string | null {
   return match ? match[1] : null;
 }
 
-function formatDuration(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
-/** Widest-first, so the highest quality rendition of a media item wins. */
-function resolutionWidth(media: any): number {
-  const w = String(media?.resolution ?? media?.quality ?? "").match(/^(\d+)/);
-  return w ? Number(w[1]) : 0;
-}
-
 /**
  * POST /api/instagram/preview
  * Body: { url: string }
  * Returns: PreviewResult
  *
- * Uses instagram-reels-downloader-api.p.rapidapi.com → GET /download?url=<url>
- * Handles both /p/ posts and /reel/ reels.
- * Response: { success, data: { title, author, owner:{username}, thumbnail,
- *             shortcode, duration, medias:[{id, url, thumbnail, type,
- *             extension, quality, resolution, duration}] } }
+ * Handles /p/ posts, carousels, /reel/ reels and /tv/ IGTV.
+ * Upstream returns { media: [{ type, quality, thumbnail, url }] } — one entry
+ * per carousel slide, and no caption or handle, which oembed supplies.
  */
 router.post("/preview", async (req: Request, res: Response) => {
   const { url } = req.body as { url?: string };
@@ -121,63 +143,40 @@ router.post("/preview", async (req: Request, res: Response) => {
   }
 
   try {
-    const data = await fetchInstagramMedia(url);
+    // The caption and handle come from oembed, which costs no RapidAPI quota
+    // and is allowed to fail — so run it alongside rather than before.
+    const [media, meta] = await Promise.all([
+      fetchInstagramMedia(url),
+      fetchOembedMeta(url),
+    ]);
 
-    // Reels ship a separate audio track alongside the video — it is not a
-    // downloadable item of its own, so drop it before building the list.
-    // NB: `is_audio` is true on the *video* entry too (it means "has sound"),
-    // so `type` is the only field that identifies the standalone audio track.
-    const playable: any[] = (data?.medias ?? []).filter(
-      (m: any) =>
-        m?.url &&
-        m.type !== "audio" &&
-        !String(m.mimeType ?? "").startsWith("audio/")
-    );
+    // A carousel returns one entry per slide, already one per item.
+    const items: MediaItem[] = media
+      .filter((m: any) => m?.url)
+      .map((m: any, i: number) => {
+        const isVideo = m.type === "video";
+        return {
+          id: `${shortcode}${i > 0 ? `_${i}` : ""}`,
+          type: isVideo ? "video" : "image",
+          // Images carry no separate thumbnail — the media URL is the preview.
+          thumbnail: m.thumbnail || (!isVideo ? m.url : ""),
+          downloadUrl: m.url,
+          title:
+            (meta.title || "").split("\n")[0].slice(0, 80) || `Item ${i + 1}`,
+        } as MediaItem;
+      });
 
-    // Carousels return one entry per slide; a single item can still return
-    // several renditions sharing an id. Keep the widest per id.
-    const bestById = new Map<string, any>();
-    playable.forEach((m: any, i: number) => {
-      const key = String(m.id ?? i);
-      const current = bestById.get(key);
-      if (!current || resolutionWidth(m) > resolutionWidth(current)) {
-        bestById.set(key, m);
-      }
-    });
-    const medias = [...bestById.values()];
-
-    if (medias.length === 0) {
+    if (items.length === 0) {
       return res.status(404).json({
         error: "No downloadable media found in this post.",
       });
     }
 
-    // owner.username is the real handle; author is the display name.
-    const author: string = data?.owner?.username ?? data?.author ?? "Instagram";
-    const title: string = data?.title ?? "";
-    const topThumb: string = data?.thumbnail ?? medias[0]?.thumbnail ?? "";
-
-    const items: MediaItem[] = medias.map((m: any, i: number) => {
-      const isVideo =
-        m.type === "video" || String(m.extension).toLowerCase() === "mp4";
-      const seconds = Number(m.duration ?? data?.duration ?? 0);
-
-      return {
-        id: String(m.id ?? shortcode + (i > 0 ? `_${i}` : "")),
-        type: isVideo ? "video" : "image",
-        // Images carry no separate thumbnail — the media URL is the preview.
-        thumbnail: m.thumbnail || (!isVideo ? m.url : topThumb),
-        downloadUrl: m.url,
-        title: (title || "").split("\n")[0].slice(0, 80) || `Item ${i + 1}`,
-        duration: seconds > 0 ? formatDuration(Math.round(seconds)) : undefined,
-      } as MediaItem;
-    });
-
     const result: PreviewResult = {
       platform: "instagram",
-      author,
-      title,
-      thumbnail: topThumb || items[0]?.thumbnail || "",
+      author: meta.author || "Instagram",
+      title: meta.title,
+      thumbnail: items[0]?.thumbnail ?? "",
       items,
     };
 
@@ -377,82 +376,27 @@ router.post("/stories", async (req: Request, res: Response) => {
   }
 
   const username = match[1];
-  const storyId = match[2];
 
   try {
-    const apiRes = await fetch(
-      `https://${STORIES_API_HOST}/get_ig_user_stories.php`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "X-RapidAPI-Key": RAPIDAPI_KEY,
-          "X-RapidAPI-Host": STORIES_API_HOST,
-        },
-        body: `username_or_url=${encodeURIComponent(username)}`,
-      }
-    );
+    // The same endpoint resolves story links, so the story URL goes straight
+    // through. It returns the poster's whole active tray, not just the linked
+    // story — the response carries no ids to narrow it by, so we show the tray.
+    const media = await fetchInstagramMedia(url);
 
-    const responseText = await apiRes.text();
-
-    if (!apiRes.ok) {
-      console.error("[instagram/story] API error:", apiRes.status, responseText);
-      return res.status(502).json({
-        error: `Instagram API error ${apiRes.status}: ${responseText}`,
-      });
-    }
-
-    let json: any;
-    try { json = JSON.parse(responseText); } catch {
-      return res.status(502).json({ error: "Invalid JSON from Instagram API" });
-    }
-
-    if (json?.success === false || json?.error) {
-      return res.status(404).json({
-        error: json?.error ?? "Story not found or account is private.",
-      });
-    }
-
-    // Endpoint returns a bare array of story items.
-    const tray: any[] = Array.isArray(json) ? json : [json];
-
-    // Story ids look like "3973701598586094809_787132" — the leading pk is the
-    // storyId from the URL. Narrow to it if that story is still live.
-    const linked = tray.filter(
-      (s: any) =>
-        String(s?.pk) === storyId || String(s?.id ?? "").split("_")[0] === storyId
-    );
-    const results: any[] = linked.length > 0 ? linked : tray;
-
-    const items: MediaItem[] = results.map((s: any, i: number) => {
-      // media_type 2 = video, 1 = image
-      const isVideo = s?.media_type === 2 || !!s?.video_versions?.length;
-
-      // Best video URL — pick highest bitrate
-      const videoVersions: any[] = s?.video_versions ?? [];
-      const videoUrl: string = videoVersions.sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? "";
-
-      // Best image URL — pick highest resolution candidate
-      const imgCandidates: any[] = s?.image_versions2?.candidates ?? [];
-      const imgUrl: string = imgCandidates.sort((a: any, b: any) => (b.width ?? 0) - (a.width ?? 0))[0]?.url ?? "";
-
-      const mediaUrl = isVideo ? videoUrl : imgUrl;
-      const thumbUrl = imgUrl;
-
-      const durationSec = s?.video_duration ?? 0;
-
-      return {
-        id: s?.pk ?? s?.id ?? `story_${i}`,
-        type: isVideo ? "video" : "image",
-        thumbnail: thumbUrl,
-        downloadUrl: mediaUrl,
+    const items: MediaItem[] = media
+      .filter((m: any) => m?.url)
+      .map((m: any, i: number) => ({
+        id: `${username}_story_${i}`,
+        type: m.type === "video" ? "video" : "image",
+        thumbnail: m.thumbnail || (m.type !== "video" ? m.url : ""),
+        downloadUrl: m.url,
         title: `Story ${i + 1}`,
-        duration: durationSec ? formatDuration(Math.round(durationSec)) : undefined,
-      } as MediaItem;
-    }).filter((item) => !!item.downloadUrl);
+      })) as MediaItem[];
 
     if (items.length === 0) {
-      return res.status(404).json({ error: "No downloadable media found in this story." });
+      return res
+        .status(404)
+        .json({ error: "No downloadable media found in this story." });
     }
 
     const result: PreviewResult = {
@@ -465,8 +409,22 @@ router.post("/stories", async (req: Request, res: Response) => {
 
     return res.json(result);
   } catch (err: any) {
-    console.error("[instagram/story]", err);
-    return res.status(500).json({ error: err.message ?? "Internal server error" });
+    const message = err?.message ?? "Internal server error";
+    console.error("[instagram/stories]", message);
+
+    if (/exceeded the (monthly quota|rate limit)/i.test(message)) {
+      return res
+        .status(429)
+        .json({ error: "Download limit reached. Please try again later." });
+    }
+    if (TRANSIENT_ERROR.test(message)) {
+      return res.status(503).json({
+        error: "Instagram is busy right now. Please try again in a moment.",
+      });
+    }
+    return res.status(502).json({
+      error: "Story not found. It may have expired or the account is private.",
+    });
   }
 });
 

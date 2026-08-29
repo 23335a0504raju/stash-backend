@@ -1,6 +1,14 @@
 import "dotenv/config";
+import dns from "dns";
 import express from "express";
 import cors from "cors";
+
+// Instagram's scontent-*.cdninstagram.com hosts publish both A and AAAA
+// records. node-fetch v2 has no Happy Eyeballs fallback (unlike curl), so on a
+// network without a working IPv6 route it picks the AAAA address and hangs
+// until ETIMEDOUT — every thumbnail and download 500s. Prefer IPv4 for all
+// outbound requests; measured 827ms over IPv4 vs a 20s timeout over IPv6.
+dns.setDefaultResultOrder("ipv4first");
 import instagramRouter from "./routes/instagram";
 import youtubeRouter from "./routes/youtube";
 import feedbackRouter from "./routes/feedback";
